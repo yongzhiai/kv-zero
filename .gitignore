@@ -1,0 +1,8 @@
+# Build output
+/bin/
+
+# Runtime snapshot data
+/data/
+
+# Go workspace / test artifacts
+*.out

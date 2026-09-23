@@ -1,0 +1,10 @@
+{
+  "name": "kv-zero",
+  "install": "go mod download && go build ./...",
+  "terminals": [
+    {
+      "name": "kvserver",
+      "command": "go run ./cmd/kvserver -addr :8080 -data data/kv.json"
+    }
+  ]
+}
