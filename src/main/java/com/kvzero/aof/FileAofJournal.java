@@ -2,9 +2,6 @@ package com.kvzero.aof;
 
 import com.kvzero.config.AofFsyncMode;
 import com.kvzero.store.KvStore;
-
-import io.netty.buffer.ByteBuf;
-
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -16,6 +13,8 @@ import java.util.Base64;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
+import org.jctools.queues.MpscUnboundedArrayQueue;
 
 /**
  * LEARNER CORE #2 — implement this class.
@@ -24,119 +23,211 @@ import java.util.concurrent.TimeUnit;
  * {@link AofFsyncMode#EVERYSEC}.
  */
 public final class FileAofJournal implements AofJournal {
+  private static final int QUEUE_CHUNK = 1024;
+
   private final Path aofPath;
   private final AofFsyncMode mode;
-  //单线程的定时任务线程池
-  private final ScheduledExecutorService scheduledExecutorService=Executors.newSingleThreadScheduledExecutor();
-  //文件channel
+  private final ScheduledExecutorService scheduledExecutorService =
+      Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "kv-aof-fsync");
+        thread.setDaemon(true);
+        return thread;
+      });
   private final FileChannel fileChannel;
+  private final MpscUnboundedArrayQueue<AofOp> queue = new MpscUnboundedArrayQueue<>(QUEUE_CHUNK);
+  private final Object lifecycle = new Object();
+  private final Object channelLock = new Object();
+  private final Thread consumer;
+  private volatile boolean closed;
 
   public FileAofJournal(Path aofPath, AofFsyncMode mode) {
     this.aofPath = aofPath;
     this.mode = mode;
-    // TODO(learner): open channel / create parent dirs / start everysec ticker
     try {
-      this.fileChannel=FileChannel.open(aofPath, StandardOpenOption.CREATE, StandardOpenOption.APPEND
-        ,StandardOpenOption.WRITE,StandardOpenOption.READ);
-
-      if(mode==AofFsyncMode.EVERYSEC){
-        scheduledExecutorService.scheduleAtFixedRate(()->{
-          try {
-            fileChannel.force(true);
-          } catch (IOException e) {
-            System.err.println("Error fsyncing AOF file: " + e.getMessage());
-          }
-        }, 0, 1, TimeUnit.SECONDS);
-      }
+      this.fileChannel = FileChannel.open(aofPath, StandardOpenOption.CREATE, StandardOpenOption.READ,
+          StandardOpenOption.WRITE);
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
+    if (mode == AofFsyncMode.EVERYSEC) {
+      scheduledExecutorService.scheduleAtFixedRate(() -> {
+        try {
+          synchronized (channelLock) {
+            if (!closed) {
+              fileChannel.force(true);
+            }
+          }
+        } catch (IOException e) {
+          System.err.println("Error fsyncing AOF file: " + e.getMessage());
+        }
+      }, 1, 1, TimeUnit.SECONDS);
+    }
+    consumer = Thread.ofPlatform().name("kv-aof").daemon(true).unstarted(this::consume);
+    consumer.start();
+  }
+
+  @Override
+  public AofOp startPut(String key, byte[] value, long expireAtEpochMs) {
+    return new AofOp(this, true, key, value, expireAtEpochMs, mode == AofFsyncMode.ALWAYS);
+  }
+
+  @Override
+  public AofOp startDel(String key) {
+    return new AofOp(this, false, key, null, 0L, mode == AofFsyncMode.ALWAYS);
+  }
+
+  void enqueue(AofOp op) {
+    synchronized (lifecycle) {
+      if (closed) {
+        throw new IllegalStateException("AOF journal is closed");
+      }
+      queue.offer(op);
+    }
+    LockSupport.unpark(consumer);
   }
 
   @Override
   public void appendPut(String key, byte[] value, long expireAtEpochMs) throws IOException {
-    //PUT &lt;key&gt; &lt;expireAtEpochMs&gt; &lt;base64(value)&gt;
-    //计算缓冲容量
-    int capacity = 4
-    + key.getBytes(StandardCharsets.UTF_8).length
-    + 1
-    + Long.toString(expireAtEpochMs).length()
-    + 1
-    + ((value.length + 2) / 3) * 4
-    + 1;
-    ByteBuffer buffer=ByteBuffer.allocate(capacity);
-    buffer.put("PUT ".getBytes(StandardCharsets.UTF_8));
-    buffer.put(key.getBytes(StandardCharsets.UTF_8));
-    buffer.put(" ".getBytes(StandardCharsets.UTF_8));
-    buffer.put(Long.toString(expireAtEpochMs).getBytes(StandardCharsets.UTF_8));
-    buffer.put(" ".getBytes(StandardCharsets.UTF_8));
-    buffer.put(Base64.getEncoder().encode(value));
-    buffer.put("\n".getBytes(StandardCharsets.UTF_8));
-    buffer.flip();
-
-    while (buffer.hasRemaining()) {
-      fileChannel.write(buffer);
-    }
-    if(mode==AofFsyncMode.ALWAYS){
-      fileChannel.force(true);
-    }
+    AofOp op = startPut(key, value, expireAtEpochMs);
+    op.offer();
+    op.finish();
   }
 
   @Override
   public void appendDel(String key) throws IOException {
-    //DEL &lt;key&gt;
-    int capacity = 4
-    + key.getBytes(StandardCharsets.UTF_8).length
-    + 1;
-    ByteBuffer buffer=ByteBuffer.allocate(capacity);
-    buffer.put("DEL ".getBytes(StandardCharsets.UTF_8));
-    buffer.put(key.getBytes(StandardCharsets.UTF_8));
-    buffer.put("\n".getBytes(StandardCharsets.UTF_8));
+    AofOp op = startDel(key);
+    op.offer();
+    op.finish();
+  }
+
+  private void consume() {
+    while (true) {
+      AofOp op;
+      synchronized (lifecycle) {
+        op = queue.poll();
+        if (op == null && closed) {
+          return;
+        }
+      }
+      if (op == null) {
+        LockSupport.park();
+        continue;
+      }
+      try {
+        writeOp(op);
+        op.complete();
+      } catch (IOException e) {
+        op.fail(e);
+      }
+    }
+  }
+
+  private void writeOp(AofOp op) throws IOException {
+    synchronized (channelLock) {
+      fileChannel.position(fileChannel.size());
+      if (op.put) {
+        writePut(op.key, op.value, op.expireAtEpochMs);
+      } else {
+        writeDel(op.key);
+      }
+      if (mode == AofFsyncMode.ALWAYS) {
+        fileChannel.force(true);
+      }
+    }
+  }
+
+  private void writePut(String key, byte[] value, long expireAtEpochMs) throws IOException {
+    byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+    byte[] expireBytes = Long.toString(expireAtEpochMs).getBytes(StandardCharsets.UTF_8);
+    byte[] encoded = Base64.getEncoder().encode(value);
+    int capacity = 4 + keyBytes.length + 1 + expireBytes.length + 1 + encoded.length + 1;
+    ByteBuffer buffer = ByteBuffer.allocate(capacity);
+    buffer.put("PUT ".getBytes(StandardCharsets.UTF_8));
+    buffer.put(keyBytes);
+    buffer.put((byte) ' ');
+    buffer.put(expireBytes);
+    buffer.put((byte) ' ');
+    buffer.put(encoded);
+    buffer.put((byte) '\n');
     buffer.flip();
+    writeFully(buffer);
+  }
+
+  private void writeDel(String key) throws IOException {
+    byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+    ByteBuffer buffer = ByteBuffer.allocate(4 + keyBytes.length + 1);
+    buffer.put("DEL ".getBytes(StandardCharsets.UTF_8));
+    buffer.put(keyBytes);
+    buffer.put((byte) '\n');
+    buffer.flip();
+    writeFully(buffer);
+  }
+
+  private void writeFully(ByteBuffer buffer) throws IOException {
     while (buffer.hasRemaining()) {
       fileChannel.write(buffer);
-    }
-    if(mode==AofFsyncMode.ALWAYS){
-      fileChannel.force(true);
     }
   }
 
   @Override
   public void replayInto(KvStore store) throws IOException {
-    //重启时，从aof文件中读取数据，并写入到store中
-    ByteBuffer buffer=ByteBuffer.allocate(1024);
-    fileChannel.position(0);
-    ByteArrayOutputStream line=new ByteArrayOutputStream();
-    while(fileChannel.read(buffer)!=-1){
-      buffer.flip();
-      while(buffer.hasRemaining()){
-        byte b = buffer.get();
-        if(b=='\n'){
-          apply(store,line.toByteArray());
-          line.reset();
-        }else{
-          line.write(b);
+    synchronized (channelLock) {
+      ByteBuffer buffer = ByteBuffer.allocate(1024);
+      fileChannel.position(0);
+      ByteArrayOutputStream line = new ByteArrayOutputStream();
+      while (true) {
+        int n = fileChannel.read(buffer);
+        if (n <= 0) {
+          break;
         }
+        buffer.flip();
+        while (buffer.hasRemaining()) {
+          byte b = buffer.get();
+          if (b == '\n') {
+            apply(store, line.toByteArray());
+            line.reset();
+          } else {
+            line.write(b);
+          }
+        }
+        buffer.clear();
       }
     }
   }
 
-  private void apply(KvStore store,byte[] line){
-    //转换为StandardCharsets.UTF_8的字符串
+  private void apply(KvStore store, byte[] line) {
+    if (line.length == 0) {
+      return;
+    }
     String lineStr = new String(line, StandardCharsets.UTF_8);
-    //分割字符串
     String[] parts = lineStr.split(" ");
-    if(parts[0].equals("PUT")){
+    if (parts[0].equals("PUT")) {
       store.put(parts[1], Base64.getDecoder().decode(parts[3]), Long.parseLong(parts[2]));
-    }else if(parts[0].equals("DEL")){
+    } else if (parts[0].equals("DEL")) {
       store.delete(parts[1]);
     }
   }
 
   @Override
   public void close() throws IOException {
+    synchronized (lifecycle) {
+      if (closed) {
+        return;
+      }
+      closed = true;
+    }
+    LockSupport.unpark(consumer);
+    try {
+      consumer.join();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("interrupted closing AOF", e);
+    }
     scheduledExecutorService.shutdown();
-    fileChannel.close();
+    synchronized (channelLock) {
+      fileChannel.force(true);
+      fileChannel.close();
+    }
   }
 
   Path aofPath() {

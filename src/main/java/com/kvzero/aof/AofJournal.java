@@ -19,6 +19,14 @@ import java.io.IOException;
  * </ul>
  */
 public interface AofJournal extends AutoCloseable {
+  /**
+   * Prepare a PUT record. Offer it inside the key's {@code compute}, then {@link AofOp#finish()}.
+   */
+  AofOp startPut(String key, byte[] value, long expireAtEpochMs);
+
+  /** Prepare a DEL record. Offer it only when this call actually removes the key. */
+  AofOp startDel(String key);
+
   void appendPut(String key, byte[] value, long expireAtEpochMs) throws IOException;
 
   void appendDel(String key) throws IOException;

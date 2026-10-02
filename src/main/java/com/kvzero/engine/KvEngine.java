@@ -27,15 +27,17 @@ public final class KvEngine implements AutoCloseable {
   public void put(String key, byte[] value, long expireAtEpochMs) throws IOException {
     requireKey(key);
     Objects.requireNonNull(value, "value");
-    store.put(key, value, expireAtEpochMs);
-    aof.appendPut(key, value, expireAtEpochMs);
+    var op = aof.startPut(key, value, expireAtEpochMs);
+    store.put(key, value, expireAtEpochMs, op::offer);
+    op.finish();
   }
 
   public Optional<byte[]> get(String key) throws IOException {
     requireKey(key);
-    GetResult result = store.get(key);
+    var op = aof.startDel(key);
+    GetResult result = store.get(key, op::offer);
+    op.finish();
     if (result.expiredAndRemoved()) {
-      aof.appendDel(key);
       return Optional.empty();
     }
     return result.value();
@@ -43,10 +45,9 @@ public final class KvEngine implements AutoCloseable {
 
   public boolean delete(String key) throws IOException {
     requireKey(key);
-    boolean removed = store.delete(key);
-    if (removed) {
-      aof.appendDel(key);
-    }
+    var op = aof.startDel(key);
+    boolean removed = store.delete(key, op::offer);
+    op.finish();
     return removed;
   }
 
