@@ -11,12 +11,15 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /** Netty HTTP server skeleton: IO threads decode HTTP; business work runs on a separate pool. */
 public final class HttpKvServer implements AutoCloseable {
+  /** Close a connection that has neither read nor written for this long. */
+  private static final int IDLE_SECONDS = 60;
   private final int port;
   private final KvEngine engine;
   private final EventLoopGroup boss;
@@ -44,6 +47,7 @@ public final class HttpKvServer implements AutoCloseable {
           @Override
           protected void initChannel(SocketChannel ch) {
             ch.pipeline()
+                .addLast(new IdleStateHandler(0, 0, IDLE_SECONDS))
                 .addLast(new HttpServerCodec())
                 .addLast(new HttpObjectAggregator(16 * 1024 * 1024))
                 .addLast(new KvHttpHandler(engine, business));

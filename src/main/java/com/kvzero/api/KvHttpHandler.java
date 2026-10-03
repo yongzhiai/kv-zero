@@ -10,10 +10,13 @@ import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderValues;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.QueryStringDecoder;
+import io.netty.handler.timeout.IdleStateEvent;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
@@ -39,24 +42,26 @@ public final class KvHttpHandler extends SimpleChannelInboundHandler<FullHttpReq
 
   @Override
   protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
-    business.execute(() -> handle(ctx, req.retain()));
+    req.retain();
+    business.execute(() -> handle(ctx, req));
   }
 
   private void handle(ChannelHandlerContext ctx, FullHttpRequest req) {
+    boolean keepAlive = HttpUtil.isKeepAlive(req);
     try {
       QueryStringDecoder decoder = new QueryStringDecoder(req.uri());
       String path = decoder.path();
       if ("/health".equals(path) && req.method() == HttpMethod.GET) {
-        write(ctx, HttpResponseStatus.OK, Unpooled.copiedBuffer("ok", StandardCharsets.UTF_8), "text/plain");
+        write(ctx, HttpResponseStatus.OK, Unpooled.copiedBuffer("ok", StandardCharsets.UTF_8), "text/plain", keepAlive);
         return;
       }
       if (!path.startsWith("/kv/")) {
-        write(ctx, HttpResponseStatus.NOT_FOUND, Unpooled.EMPTY_BUFFER, "text/plain");
+        write(ctx, HttpResponseStatus.NOT_FOUND, Unpooled.EMPTY_BUFFER, "text/plain", keepAlive);
         return;
       }
       String key = path.substring("/kv/".length());
       if (key.isEmpty()) {
-        write(ctx, HttpResponseStatus.BAD_REQUEST, text("missing key"), "text/plain");
+        write(ctx, HttpResponseStatus.BAD_REQUEST, text("missing key"), "text/plain", keepAlive);
         return;
       }
 
@@ -64,15 +69,15 @@ public final class KvHttpHandler extends SimpleChannelInboundHandler<FullHttpReq
         byte[] body = toBytes(req.content());
         long expireAt = parseExpireAt(decoder);
         engine.put(key, body, expireAt);
-        write(ctx, HttpResponseStatus.NO_CONTENT, Unpooled.EMPTY_BUFFER, "application/octet-stream");
+        write(ctx, HttpResponseStatus.NO_CONTENT, Unpooled.EMPTY_BUFFER, "application/octet-stream", keepAlive);
         return;
       }
       if (req.method() == HttpMethod.GET) {
         Optional<byte[]> value = engine.get(key);
         if (value.isEmpty()) {
-          write(ctx, HttpResponseStatus.NOT_FOUND, Unpooled.EMPTY_BUFFER, "application/octet-stream");
+          write(ctx, HttpResponseStatus.NOT_FOUND, Unpooled.EMPTY_BUFFER, "application/octet-stream", keepAlive);
         } else {
-          write(ctx, HttpResponseStatus.OK, Unpooled.wrappedBuffer(value.get()), "application/octet-stream");
+          write(ctx, HttpResponseStatus.OK, Unpooled.wrappedBuffer(value.get()), "application/octet-stream", keepAlive);
         }
         return;
       }
@@ -81,14 +86,15 @@ public final class KvHttpHandler extends SimpleChannelInboundHandler<FullHttpReq
         write(ctx,
             removed ? HttpResponseStatus.NO_CONTENT : HttpResponseStatus.NOT_FOUND,
             Unpooled.EMPTY_BUFFER,
-            "application/octet-stream");
+            "application/octet-stream",
+            keepAlive);
         return;
       }
-      write(ctx, HttpResponseStatus.METHOD_NOT_ALLOWED, Unpooled.EMPTY_BUFFER, "text/plain");
+      write(ctx, HttpResponseStatus.METHOD_NOT_ALLOWED, Unpooled.EMPTY_BUFFER, "text/plain", keepAlive);
     } catch (IllegalArgumentException e) {
-      write(ctx, HttpResponseStatus.BAD_REQUEST, text(e.getMessage()), "text/plain");
+      write(ctx, HttpResponseStatus.BAD_REQUEST, text(e.getMessage()), "text/plain", keepAlive);
     } catch (Exception e) {
-      write(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, text(e.toString()), "text/plain");
+      write(ctx, HttpResponseStatus.INTERNAL_SERVER_ERROR, text(e.toString()), "text/plain", keepAlive);
     } finally {
       req.release();
     }
@@ -119,11 +125,27 @@ public final class KvHttpHandler extends SimpleChannelInboundHandler<FullHttpReq
     return Unpooled.copiedBuffer(s == null ? "" : s, StandardCharsets.UTF_8);
   }
 
-  private static void write(ChannelHandlerContext ctx, HttpResponseStatus status, ByteBuf content, String ctype) {
+  private static void write(ChannelHandlerContext ctx, HttpResponseStatus status, ByteBuf content, String ctype,
+      boolean keepAlive) {
     FullHttpResponse res = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, status, content);
     res.headers().set(HttpHeaderNames.CONTENT_TYPE, ctype);
     res.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
-    ctx.writeAndFlush(res).addListener(ChannelFutureListener.CLOSE);
+    if (keepAlive) {
+      res.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.KEEP_ALIVE);
+      ctx.writeAndFlush(res);
+    } else {
+      res.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
+      ctx.writeAndFlush(res).addListener(ChannelFutureListener.CLOSE);
+    }
+  }
+
+  @Override
+  public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+    if (evt instanceof IdleStateEvent) {
+      ctx.close();
+      return;
+    }
+    ctx.fireUserEventTriggered(evt);
   }
 
   @Override

@@ -13,6 +13,7 @@ import java.util.Base64;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.LockSupport;
 import org.jctools.queues.MpscUnboundedArrayQueue;
 
@@ -24,6 +25,8 @@ import org.jctools.queues.MpscUnboundedArrayQueue;
  */
 public final class FileAofJournal implements AofJournal {
   private static final int QUEUE_CHUNK = 1024;
+  /** High bit marks the journal closed. Low bits count producers inside {@link #enqueue}. */
+  private static final int CLOSED = 1 << 30;
 
   private final Path aofPath;
   private final AofFsyncMode mode;
@@ -35,10 +38,9 @@ public final class FileAofJournal implements AofJournal {
       });
   private final FileChannel fileChannel;
   private final MpscUnboundedArrayQueue<AofOp> queue = new MpscUnboundedArrayQueue<>(QUEUE_CHUNK);
-  private final Object lifecycle = new Object();
+  private final AtomicInteger gate = new AtomicInteger();
   private final Object channelLock = new Object();
   private final Thread consumer;
-  private volatile boolean closed;
 
   public FileAofJournal(Path aofPath, AofFsyncMode mode) {
     this.aofPath = aofPath;
@@ -53,7 +55,7 @@ public final class FileAofJournal implements AofJournal {
       scheduledExecutorService.scheduleAtFixedRate(() -> {
         try {
           synchronized (channelLock) {
-            if (!closed) {
+            if ((gate.get() & CLOSED) == 0) {
               fileChannel.force(true);
             }
           }
@@ -77,11 +79,17 @@ public final class FileAofJournal implements AofJournal {
   }
 
   void enqueue(AofOp op) {
-    synchronized (lifecycle) {
-      if (closed) {
+    int state;
+    do {
+      state = gate.get();
+      if ((state & CLOSED) != 0) {
         throw new IllegalStateException("AOF journal is closed");
       }
+    } while (!gate.compareAndSet(state, state + 1));
+    try {
       queue.offer(op);
+    } finally {
+      gate.decrementAndGet();
     }
     LockSupport.unpark(consumer);
   }
@@ -102,10 +110,10 @@ public final class FileAofJournal implements AofJournal {
 
   private void consume() {
     while (true) {
-      AofOp op;
-      synchronized (lifecycle) {
+      AofOp op = queue.poll();
+      if (op == null && producersQuiesced()) {
         op = queue.poll();
-        if (op == null && closed) {
+        if (op == null) {
           return;
         }
       }
@@ -120,6 +128,11 @@ public final class FileAofJournal implements AofJournal {
         op.fail(e);
       }
     }
+  }
+
+  private boolean producersQuiesced() {
+    int state = gate.get();
+    return (state & CLOSED) != 0 && (state & ~CLOSED) == 0;
   }
 
   private void writeOp(AofOp op) throws IOException {
@@ -210,11 +223,15 @@ public final class FileAofJournal implements AofJournal {
 
   @Override
   public void close() throws IOException {
-    synchronized (lifecycle) {
-      if (closed) {
+    int state;
+    do {
+      state = gate.get();
+      if ((state & CLOSED) != 0) {
         return;
       }
-      closed = true;
+    } while (!gate.compareAndSet(state, state | CLOSED));
+    while ((gate.get() & ~CLOSED) != 0) {
+      Thread.onSpinWait();
     }
     LockSupport.unpark(consumer);
     try {
